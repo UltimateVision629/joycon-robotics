@@ -8,13 +8,13 @@ from .joycon import JoyCon
 from .gyro import GyroTrackingJoyCon
 from .event import ButtonEventJoyCon
 from .device import get_R_id, get_L_id
-from .constants import _match_p0
 
 from scipy.spatial.transform import Rotation as R
 import numpy as np
 import threading
 import logging
 
+JOYCON_SERIAL_SUPPORT = '9c:54:'
 
 class LowPassFilter:
     def __init__(self, alpha=0.1):
@@ -38,8 +38,20 @@ class AttitudeEstimator:
         self.pitch = 0.0 
         self.roll = 0.0   
         self.yaw = 0.0   
-        self.dt = 0.01  
+        # ``dt`` used to be a fixed 10 ms.  The HID callback cadence is not
+        # fixed on Windows, so retain it only as the first-sample fallback and
+        # measure subsequent intervals with a monotonic clock.
+        self.dt = 0.01
+        self._last_update_time = None
         self.alpha = 0.55
+
+        # Pitch/roll are reported relative to the pose held during Joy-Con
+        # calibration.  They are initialized from the first post-calibration
+        # accelerometer sample, which is more reliable than assuming the
+        # controller is aligned to a particular device axis.
+        self._pitch_zero = None
+        self._roll_zero = None
+        self._zero_on_next_sample = True
         
         self.yaw_diff = 0.0
         self.pitch_rad_T = pitch_Threhold
@@ -67,36 +79,78 @@ class AttitudeEstimator:
         self.direction_Y = vec3(0, 1, 0)
         self.direction_Z = vec3(0, 0, 1)
         self.direction_Q = quat()
+
+    @staticmethod
+    def _wrap_angle(angle):
+        """Wrap an angle to [-pi, pi] without a discontinuity at the baseline."""
+        return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+    @staticmethod
+    def _accel_pitch_roll(accel_in_g):
+        """Calculate gravity-referenced sensor-frame pitch and roll."""
+        ax, ay, az = accel_in_g
+        # The common pi factor in the previous implementation cancels out in
+        # atan2.  Leaving values in g also makes the formula clearer.
+        roll_acc = math.atan2(ay, -az)
+        pitch_acc = math.atan2(ax, math.sqrt(ay**2 + az**2))
+        return pitch_acc, roll_acc
+
+    def reset_attitude(self):
+        """Start a fresh pitch/roll/yaw calibration on the next IMU sample."""
+        self.pitch = 0.0
+        self.roll = 0.0
+        self.yaw = 0.0
+        self._pitch_zero = None
+        self._roll_zero = None
+        self._zero_on_next_sample = True
+        self._last_update_time = None
+        self.lpf_roll.prev_value = 0.0
+        self.lpf_pitch.prev_value = 0.0
+        self.reset_yaw()
     
     def set_yaw_diff(self,data):
         self.yaw_diff = data
         
     def update(self, gyro_in_rad, accel_in_g):
-        self.pitch = 0.0 
-        self.roll = 0.0   
-        
-        ax, ay, az = accel_in_g
-        ax = ax * math.pi
-        ay = ay * math.pi
-        az = az * math.pi
-        
+        now = time.monotonic()
+        if self._last_update_time is None:
+            dt = self.dt
+        else:
+            # Ignore debugger pauses / device reconnect gaps.  A long gap
+            # must not turn one stale gyro value into a large pose jump.
+            dt = max(0.001, min(0.050, now - self._last_update_time))
+        self._last_update_time = now
+
+        pitch_acc, roll_acc = self._accel_pitch_roll(accel_in_g)
         gx, gy, gz = gyro_in_rad
 
+        if self._zero_on_next_sample:
+            # Initialize the complementary-filter state at the measured pose,
+            # then subtract it from every public output.  Before this change
+            # the library exposed a hardware-dependent ~+0.6 rad "neutral"
+            # pitch, so pitch_down_double never applied to normal motion.
+            self.pitch = pitch_acc
+            self.roll = roll_acc
+            self._pitch_zero = pitch_acc
+            self._roll_zero = roll_acc
+            self._zero_on_next_sample = False
+
         # Calculate the pitch and roll angles provided by the accelerometers
-        roll_acc = math.atan2(ay, -az)
-        pitch_acc = math.atan2(ax, math.sqrt(ay**2 + az**2))
-        
         # Updating angles with gyroscope data
-        self.pitch += gy * self.dt
-        self.roll -= gx * self.dt
+        # Do NOT reset these two variables here.  Resetting them on every HID
+        # packet discarded all accumulated rotation, which is why a large
+        # physical pitch motion appeared as only ~0.10 rad to teleoperation.
+        self.pitch += gy * dt
+        self.roll -= gx * dt
 
         # Complementary filters: weighted fusion of accelerometer and gyroscope data
         self.pitch = self.alpha * self.pitch + (1 - self.alpha) * pitch_acc
         self.roll = self.alpha * self.roll + (1 - self.alpha) * roll_acc
         
         # The final output roll and pitch angles are then low-pass filtered
-        self.pitch = self.lpf_pitch.update(self.pitch)
-        self.roll = self.lpf_roll.update(self.roll)
+        pitch_output = self.lpf_pitch.update(self.pitch - self._pitch_zero)
+        roll_output = self.lpf_roll.update(
+            self._wrap_angle(self.roll - self._roll_zero))
         
         # Yaw angle (updated by gyroscope)
         rotation = angleAxis(gx * (-1/86), self.direction_X) \
@@ -110,31 +164,32 @@ class AttitudeEstimator:
         
         self.yaw = self.direction_X[1]
         
+        yaw_output = self.yaw
         if self.common_rad:
-            self.roll = self.roll * math.pi/1.5
-            self.pitch = self.pitch * math.pi/1.5
-            self.yaw = -self.yaw * math.pi/1.5 # * 10.0
-            
+            roll_output = roll_output * math.pi/1.5
+            pitch_output = pitch_output * math.pi/1.5
+            yaw_output = -yaw_output * math.pi/1.5 # * 10.0
+
         else:
-            self.yaw = -self.yaw * math.pi/2  
-            
+            yaw_output = -yaw_output * math.pi/2
+
         if self.pitch_down_double:
-            self.pitch = self.pitch * 3.0 if self.pitch < 0 else self.pitch
+            pitch_output = pitch_output * 3.0 if pitch_output < 0 else pitch_output
         if self.lerobot:
-            self.roll = self.roll * math.pi/2
+            roll_output = roll_output * math.pi/2
             # self.yaw = -self.yaw * math.pi/1.5 # * 10.0      
-        self.yaw = self.yaw - self.yaw_diff    
-        
+        yaw_output = yaw_output - self.yaw_diff
+
         if self.pitch_rad_T != -1:
-            self.pitch = self.pitch_rad_T if self.pitch > self.pitch_rad_T else (-self.pitch_rad_T if self.pitch < -self.pitch_rad_T else self.pitch) 
-        
+            pitch_output = self.pitch_rad_T if pitch_output > self.pitch_rad_T else (-self.pitch_rad_T if pitch_output < -self.pitch_rad_T else pitch_output)
+
         if self.roll_rad_T != -1:
-            self.roll = self.roll_rad_T if self.roll > self.roll_rad_T else (-self.roll_rad_T if self.roll < -self.roll_rad_T else self.roll) 
-        
+            roll_output = self.roll_rad_T if roll_output > self.roll_rad_T else (-self.roll_rad_T if roll_output < -self.roll_rad_T else roll_output)
+
         if self.yaw_rad_T != -1:
-            self.yaw = self.yaw_rad_T if self.yaw > self.yaw_rad_T else (-self.yaw_rad_T if self.yaw < -self.yaw_rad_T else self.yaw) 
-        
-        orientation = [self.roll, self.pitch, self.yaw]
+            yaw_output = self.yaw_rad_T if yaw_output > self.yaw_rad_T else (-self.yaw_rad_T if yaw_output < -self.yaw_rad_T else yaw_output)
+
+        orientation = [roll_output, pitch_output, yaw_output]
         # Return roll angle, pitch angle, yaw angle (in radians)
         return orientation
 
@@ -174,8 +229,7 @@ class JoyconRobotics:
         else:
             print("get a wrong device name of joycon")
 
-        if not _match_p0(self.joycon_id[2]):
-            raise IOError("joycon connect failed")
+        device_serial = self.joycon_id[2][:6]
         
         # init joycon
         self.joycon = JoyCon(*self.joycon_id)
@@ -231,7 +285,13 @@ class JoyconRobotics:
         self.all_button_return = all_button_return
         
         self.button_control = 0
-        
+
+        # The vendor_id and product_id checks in JoyCon() already verify
+        # that this is a valid Joy-Con. Serial number format varies across
+        # hardware revisions — do not reject devices with non-standard serials.
+        if self.joycon_id is None or self.joycon_id[0] is None:
+            raise IOError("There is no joycon for robotics")
+
         self.running = True
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self.solve_loop, daemon=True)
@@ -246,8 +306,11 @@ class JoyconRobotics:
 
         self.gyro.calibrate()
         time.sleep(2)
-        self.gyro.reset_orientation
-        self.orientation_sensor.reset_yaw()
+        self.gyro.reset_orientation()
+        # gyro.calibrate() handles gyro bias; reset_attitude() additionally
+        # makes the pose held during this calibration the pitch/roll zero.
+        # The first fresh IMU sample supplies that gravity reference.
+        self.orientation_sensor.reset_attitude()
 
         print(f"\033[32mJoycon calibrations is complete.\033[0m")
     

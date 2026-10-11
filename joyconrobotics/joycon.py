@@ -1,6 +1,5 @@
-from .constants import JOYCON_VENDOR_ID, JOYCON_PRODUCT_IDS
-from .constants import JOYCON_L_PRODUCT_ID, JOYCON_R_PRODUCT_ID, JOYCON_REPORT_DEFAULT
-from .constants import _match_p1
+from .constants import JOYCON_VENDOR_ID, JOYCON_PRODUCT_IDS, JOYCON_SERIAL_HEAD
+from .constants import JOYCON_L_PRODUCT_ID, JOYCON_R_PRODUCT_ID, JOYCON_REPORT_DEFAULT, JOYCON_SERIAL_SUPPORT
 import hid
 import time
 import threading
@@ -22,21 +21,18 @@ class JoyCon:
     color_btn  : (int, int, int)
 
     def __init__(self, vendor_id: int, product_id: int, serial: str = None, simple_mode=False):
-        if vendor_id != JOYCON_VENDOR_ID:
+        if vendor_id not in (JOYCON_VENDOR_ID, 0x057A):
             raise ValueError(f'vendor_id is invalid: {vendor_id!r}')
 
         if product_id not in JOYCON_PRODUCT_IDS:
             raise ValueError(f'product_id is invalid: {product_id!r}')
         
-        if not _match_p1(serial):
-            raise IOError('joycon connect failed')
-
         self.vendor_id   = vendor_id
         self.product_id  = product_id
         self.serial      = serial
         self.simple_mode = simple_mode  # TODO: It's for reporting mode 0x3f
         
-        if not _match_p1(serial):
+        if serial is None or serial[:9] not in JOYCON_SERIAL_HEAD:
             self.calibrate_value = True
         else:
             self.calibrate_value = False
